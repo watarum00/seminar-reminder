@@ -1,0 +1,27 @@
+name: Daily Schedule Reminder
+on:
+  schedule:
+    # 例: 日本時間06:00実行 → UTC 21:00
+    - cron: '0 21 * * 0'
+  workflow_dispatch:  # 任意で手動実行も可能にする
+jobs:
+  remind:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+      - name: Run reminder script (public sheet + APIキー方式)
+        env:
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}
+          TZ: 'Asia/Tokyo'
+        run: |
+          python scripts/post_daily.py

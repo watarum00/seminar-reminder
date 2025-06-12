@@ -1,0 +1,1 @@
+ゼミ予定自動通知slackbotを動かすGithub actions
