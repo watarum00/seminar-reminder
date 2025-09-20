@@ -36,7 +36,7 @@ def load_public_sheet_records():
         raise RuntimeError("環境変数 GOOGLE_API_KEY または SHEET_ID が設定されていません")
     # Sheets API クライアントを API キー付きで構築
     service = build('sheets', 'v4', developerKey=api_key)
-    # スプレッドシートのメタデータ取得→最初のシート名取得
+    # スプレッドシートのメタデータ取得（全シートの title と index を取得）
     try:
         meta = service.spreadsheets().get(spreadsheetId=sheet_id, fields="sheets(properties(title,index))").execute()
     except Exception as e:
@@ -44,11 +44,38 @@ def load_public_sheet_records():
     sheets = meta.get('sheets', [])
     if not sheets:
         raise RuntimeError("スプレッドシートにシートが存在しません")
-    # ここでは index=0 のシートを使う
-    first = sheets[0]['properties']
-    sheet_name = first['title']
+
+    # 環境変数で参照したいシートを指定可能にする
+    # 優先度: SHEET_NAME が最優先、次に SHEET_INDEX（0-based）。未指定なら先頭シートを使用
+    sheet_name_env = os.environ.get('SHEET_NAME')
+    sheet_index_env = os.environ.get('SHEET_INDEX')
+
+    sheet_name = None
+    if sheet_name_env:
+        # 指定されたシート名をそのまま使用（存在確認は後続の API 呼び出しで失敗するためこの時点では軽く trim）
+        sheet_name = sheet_name_env.strip()
+    elif sheet_index_env:
+        try:
+            idx = int(sheet_index_env)
+        except ValueError:
+            raise RuntimeError(f"環境変数 SHEET_INDEX が整数ではありません: {sheet_index_env}")
+        # sheets の中から index が一致するシートを探す
+        matched = None
+        for s in sheets:
+            props = s.get('properties', {})
+            if props.get('index') == idx:
+                matched = props
+                break
+        if matched is None:
+            raise RuntimeError(f"スプレッドシートに index={idx} のシートが見つかりません")
+        sheet_name = matched.get('title')
+    else:
+        # デフォルト: 先頭シート
+        first = sheets[0]['properties']
+        sheet_name = first['title']
     # シート全体の値を取得（header も含む）
     try:
+        # range にシート名を指定すると、そのシートの全セルを取得します
         result = service.spreadsheets().values().get(
             spreadsheetId=sheet_id,
             range=sheet_name
@@ -68,6 +95,11 @@ def load_public_sheet_records():
             rec[h] = row[i] if i < len(row) else ''
         records.append(rec)
         # print(f"Loaded record: {rec}")
+    # デバッグ出力: ヘッダと最初の数行
+    if os.environ.get('DEBUG'):
+        print(f"[DEBUG] Loaded {len(records)} records. Headers: {headers}")
+        for i, r in enumerate(records[:10]):
+            print(f"[DEBUG] record[{i}]: {r}")
     return records
 
 def parse_date_str(date_str, reference_year):
@@ -96,27 +128,71 @@ def find_week_events(records, week_dates):
     events = []
     monday = min(week_dates)
     reference_year = monday.year
+    debug = bool(os.environ.get('DEBUG'))
     for row in records:
+        if debug:
+            print(f"[DEBUG] row raw: {row}")
         date_str = row.get('日付') or row.get('date') or row.get('Date') or ''
         time_str = row.get('テスト時間') or row.get('time') or row.get('Time') or ''
+        # 予定のタイプ（優先: 予定タイプ > タイプ > 種別 > type）
+        type_str = (row.get('予定タイプ') or row.get('タイプ') or row.get('種別') or row.get('type') or row.get('Type') or '').strip()
         content = row.get('内容') or row.get('content') or ''
         person = row.get('担当') or row.get('person') or ''
+
+        # 欠席者列（優先: 欠席予定 > 欠席者 > 欠席 > absent）
+        absent_raw = (row.get('欠席予定') or row.get('欠席者') or row.get('欠席') or row.get('absent') or row.get('Absentees') or '')
+        absent_raw = str(absent_raw).strip()
+
         if not date_str:
+            if debug:
+                print(f"[DEBUG] skipping row because date_str is empty: {row}")
             continue
         d = parse_date_str(str(date_str).strip(), reference_year)
         if d is None:
+            if debug:
+                print(f"[DEBUG] could not parse date from '{date_str}' (ref year {reference_year})")
             continue
+
         if d in week_dates:
-            print(f"Found event on {d}: {content} (time: {time_str}, person: {person})")
-            if time_str:
-                events.append({
-                    'date': d,
-                    'time': time_str,
-                    'content': content,
-                    'person': person,
-                    'row': row,
-                })
-                print(f"Added event: {events[-1]}")
+            if debug:
+                print(f"[DEBUG] Found event on {d}: {content} (time: {time_str}, person: {person}, type: {type_str})")
+            # type_str の扱い:
+            # - 空文字: 何もしない
+            # - 'ゼミ' : ゼミ扱い（time がある場合のみ追加）
+            # - それ以外: 未知の値は '重要日程' 扱いにする（時間表示や注意は出さない）
+            if type_str == 'ゼミ':
+                ev_type = 'ゼミ'
+            else:
+                ev_type = '重要日程'
+
+            # 欠席者表示: 要求により、'欠席予定' の文字列をそのまま出力します（分割しない）
+            absent_display = absent_raw if absent_raw else None
+
+            ev = {
+                'date': d,
+                'time': time_str if time_str else None,
+                'content': content,
+                'person': person,
+                'row': row,
+                'type': ev_type,
+                'type_raw': type_str,
+                'absent_raw': absent_raw,
+                'absent_display': absent_display,
+            }
+
+            if ev['type'] == 'ゼミ':
+                if ev['time']:
+                    events.append(ev)
+                    if debug:
+                        print(f"[DEBUG] Added event (ゼミ): {events[-1]}")
+                else:
+                    if debug:
+                        print(f"[DEBUG] Skip event (ゼミ) without time: {content}")
+            else:
+                # 重要日程扱い（未知のタイプもここに入る）
+                events.append(ev)
+                if debug:
+                    print(f"[DEBUG] Added event (重要日程): {events[-1]}")
     return events
 
 def format_schedule(events, monday_date, week_dates):
@@ -133,14 +209,33 @@ def format_schedule(events, monday_date, week_dates):
         d = ev['date']
         md = f"{d.month}/{d.day}"
         wd = weekday_map[d.weekday()]
-        line = f"{md}({wd}): {ev['content']}"
-        if ev.get('person'):
-            line += f" - 担当: {ev['person']}"
-        if ev.get('time'):
-            line += f" - 時間: {ev['time']}"
-        if ev.get('time') != '13:00-14:30':
-            line += f"\n*※注意! 時間が通常の 13:00-14:30 以外です*"
-        lines.append(line)
+        # タイプ別の表示
+        if ev.get('type') == 'ゼミ':
+            # デフォルト（ゼミ）: 1行目にメイン情報（タイトル）、
+            # その下に箇条書きで担当・時間・欠席予定・注意を表示
+            header_line = f"{md}({wd}): {ev['content']}"
+            lines.append(header_line)
+
+            # 箇条書きで各フィールドを表示
+            if ev.get('person'):
+                lines.append(f"> • 担当: {ev['person']}")
+            if ev.get('time'):
+                lines.append(f"> • 時間: {ev['time']}")
+
+            # 欠席予定はそのまま表示するが、箇条書きとして出す
+            # 欠席がいない場合は 'なし' と表示する
+            if ev.get('absent_display'):
+                lines.append(f"> • 欠席予定: {ev['absent_display']}")
+            else:
+                lines.append("> • 欠席予定: なし")
+
+            # 注意表示は時間が存在し、かつ通常時間と異なる場合に箇条書きで出す
+            if ev.get('time') and ev.get('time') != '13:00-14:30':
+                lines.append("> • *※注意! 時間が通常の 13:00-14:30 以外です*")
+        else:
+            # 重要日程は時間や注意の出力を行わず、内容のみを出力
+            line = f"{md}({wd}): {ev['content']}"
+            lines.append(line)
     return "\n".join(lines)
 
 def post_to_slack(text):
@@ -164,6 +259,9 @@ def main():
     today = get_today_jst()
     monday = get_monday_date(today)
     week_dates = build_week_dates(monday)
+
+    if os.environ.get('DEBUG'):
+        print(f"[DEBUG] today: {today}, monday: {monday}, week_dates: {sorted(list(week_dates))}")
 
     # 公開シート用読み込み
     try:
