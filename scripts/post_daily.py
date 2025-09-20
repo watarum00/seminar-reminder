@@ -73,28 +73,79 @@ def load_public_sheet_records():
         # デフォルト: 先頭シート
         first = sheets[0]['properties']
         sheet_name = first['title']
-    # シート全体の値を取得（header も含む）
+    # シート全体の値と書式を取得（header も含む）。取り消し線等の書式を調べるには
+    # includeGridData=True を使って gridData を取得する必要がある。
     try:
-        # range にシート名を指定すると、そのシートの全セルを取得します
-        result = service.spreadsheets().values().get(
+        grid = service.spreadsheets().get(
             spreadsheetId=sheet_id,
-            range=sheet_name
+            ranges=[sheet_name],
+            includeGridData=True
         ).execute()
     except Exception as e:
         raise RuntimeError(f"スプレッドシートのデータ取得に失敗: {e}")
-    values = result.get('values', [])
-    if not values:
-        return []
-    # 1行目をヘッダーとみなし、以降を辞書化
-    headers = values[0]
+
     records = []
-    for row in values[1:]:
-        rec = {}
-        for i, h in enumerate(headers):
-            # 同じヘッダー名が重複していない前提
-            rec[h] = row[i] if i < len(row) else ''
-        records.append(rec)
-        # print(f"Loaded record: {rec}")
+    try:
+        sheets = grid.get('sheets', [])
+        if not sheets:
+            return []
+        data = sheets[0].get('data', [])[0]
+        rows = data.get('rowData', [])
+        if not rows:
+            return []
+
+        # ヘッダー行 (formattedValue を優先)
+        header_cells = rows[0].get('values', [])
+        headers = [c.get('formattedValue') or '' for c in header_cells]
+
+        for row in rows[1:]:
+            rec = {}
+            meta_str = {}
+            cells = row.get('values', [])
+            for i, h in enumerate(headers):
+                cell = cells[i] if i < len(cells) else {}
+                # セルの表示テキスト
+                val = cell.get('formattedValue') or ''
+                rec[h] = val
+
+                # 取り消し線判定: effectiveFormat.textFormat.strikethrough または
+                # textFormatRuns のいずれかの run に strikethrough があるかを確認
+                struck = False
+                eff = cell.get('effectiveFormat', {})
+                txtfmt = eff.get('textFormat', {}) if eff else {}
+                if txtfmt.get('strikethrough'):
+                    struck = True
+                else:
+                    runs = cell.get('textFormatRuns', [])
+                    for run in runs:
+                        fmt = run.get('format', {}).get('textFormat', {})
+                        if fmt.get('strikethrough'):
+                            struck = True
+                            break
+                meta_str[h] = struck
+
+            # 保存時にメタ情報を付与
+            rec['_meta_strikethrough'] = meta_str
+            records.append(rec)
+    except Exception:
+        # フォールバック: 何か予期せぬ形式だった場合は values API を使う既存ロジックに戻す
+        try:
+            result = service.spreadsheets().values().get(
+                spreadsheetId=sheet_id,
+                range=sheet_name
+            ).execute()
+            values = result.get('values', [])
+            if not values:
+                return []
+            headers = values[0]
+            for row in values[1:]:
+                rec = {}
+                for i, h in enumerate(headers):
+                    rec[h] = row[i] if i < len(row) else ''
+                rec['_meta_strikethrough'] = {h: False for h in headers}
+                records.append(rec)
+        except Exception as e:
+            raise RuntimeError(f"スプレッドシートのデータ取得に失敗: {e}")
     # デバッグ出力: ヘッダと最初の数行
     if os.environ.get('DEBUG'):
         print(f"[DEBUG] Loaded {len(records)} records. Headers: {headers}")
@@ -130,6 +181,19 @@ def find_week_events(records, week_dates):
     reference_year = monday.year
     debug = bool(os.environ.get('DEBUG'))
     for row in records:
+        # 日付セルに取り消し線が付いている場合はスキップする
+        # 日付キー候補をチェックして、対応する '_meta_strikethrough' が True なら無視
+        meta = row.get('_meta_strikethrough', {})
+        date_keys = ['日付', 'date', 'Date']
+        skipped_by_strike = False
+        for dk in date_keys:
+            if dk in row and meta.get(dk):
+                if debug:
+                    print(f"[DEBUG] skipping row because date cell has strikethrough (key={dk}): {row}")
+                skipped_by_strike = True
+                break
+        if skipped_by_strike:
+            continue
         if debug:
             print(f"[DEBUG] row raw: {row}")
         date_str = row.get('日付') or row.get('date') or row.get('Date') or ''
